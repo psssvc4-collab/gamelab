@@ -4,7 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>天国身份测验 · Kingdom Identity Quiz</title>
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
 <style>
   :root{
@@ -72,7 +71,19 @@
 <main id="app"></main>
 <div class="bar hidden" id="bar"></div>
 
-<script>
+<script type="module">
+/* ============ FIREBASE SETTINGS (paste yours here) ============ */
+const FIREBASE_CONFIG = {
+    apiKey: "AIzaSyB50qFY7J3d31rm-Ktas3z7SBsfIg3meAc",
+    authDomain: "kingdom-quiz-fd1fa.firebaseapp.com",
+    databaseURL: "https://kingdom-quiz-fd1fa-default-rtdb.asia-southeast1.firebasedatabase.app",
+    projectId: "kingdom-quiz-fd1fa",
+    storageBucket: "kingdom-quiz-fd1fa.firebasestorage.app",
+    messagingSenderId: "490278544533",
+    appId: "1:490278544533:web:1a4c8b7d3b2722d084a79c"
+};
+/* ============================================================== */
+
 /* ============ CONTENT (edit here) ============ */
 const QUESTIONS = [
   {zh:"放学／下班回家，你最想要的是？", en:"After school or work, what do you want most?",
@@ -116,16 +127,17 @@ const TIE_PREFERENCE = ["D","A","B","C"]; // on a tie, first key in this list wi
 const FOOTER = {zh:"其实，这四个身份你全都是！请抬头看讲台。", en:"Actually — you are all four! Look up at the stage."};
 /* ============================================ */
 
-const PEER_OPTS = Object.assign({debug:0}, window.PEER_OPTS || {});
 const N = QUESTIONS.length;            // steps: 0 lobby, 1..N questions, N+1 results, N+2 finale
 const STEP_RESULT = N+1, STEP_FINAL = N+2;
 const app = document.getElementById("app"), bar = document.getElementById("bar");
 const params = new URLSearchParams(location.search);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const store = {
-  get(k){ try{ return JSON.parse(localStorage.getItem(k)); }catch(e){ return null; } },
-  set(k,v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
-};
+const mk = (store) => ({
+  get(k){ try{ return JSON.parse(store.getItem(k)); }catch(e){ return null; } },
+  set(k,v){ try{ store.setItem(k, JSON.stringify(v)); }catch(e){} }
+});
+const local = mk(window.localStorage), sess = mk(window.sessionStorage);
+const rid = (n=6) => Array.from(crypto.getRandomValues(new Uint8Array(n)), b => "abcdefghjkmnpqrstuvwxyz23456789"[b % 31]).join("");
 
 function computeResult(answers){
   const t = {A:0,B:0,C:0,D:0}; let n = 0;
@@ -134,6 +146,28 @@ function computeResult(answers){
   const max = Math.max(t.A,t.B,t.C,t.D);
   return TIE_PREFERENCE.find(k => t[k]===max);
 }
+
+/* ---------- backend: Firebase Realtime Database (or a test stand-in) ---------- */
+async function connectBackend(){
+  if (window.TEST_BACKEND) return window.TEST_BACKEND();
+  if (!FIREBASE_CONFIG.databaseURL || FIREBASE_CONFIG.databaseURL.includes("PASTE")) throw new Error("config");
+  const V = "10.12.2";
+  const fa = await import(`https://www.gstatic.com/firebasejs/${V}/firebase-app.js`);
+  const fd = await import(`https://www.gstatic.com/firebasejs/${V}/firebase-database.js`);
+  const db = fd.getDatabase(fa.initializeApp(FIREBASE_CONFIG));
+  const r = p => fd.ref(db, p);
+  return {
+    set: (p, v) => fd.set(r(p), v),
+    remove: p => fd.remove(r(p)),
+    watch: (p, cb) => fd.onValue(r(p), s => cb(s.val())),
+    onConn: cb => fd.onValue(r(".info/connected"), s => cb(s.val() === true)),
+    presence: p => fd.onValue(r(".info/connected"), s => {
+      if (s.val() === true) fd.onDisconnect(r(p)).remove().then(() => fd.set(r(p), true)).catch(()=>{});
+    }),
+  };
+}
+const ROOT = sid => "kq/" + sid;
+const count = o => o ? Object.keys(o).length : 0;
 
 /* ---------- landing ---------- */
 function landing(){
@@ -149,48 +183,27 @@ function landing(){
   document.getElementById("solo").onclick = () => { location.search = "?solo"; };
 }
 
+function configError(){
+  app.innerHTML = `<div class="ph"><h1 style="font-size:28px">⚠️ 还没设定 Firebase<span class="en">Firebase settings are missing</span></h1>
+    <p class="note">请把 Firebase 设定贴进 index.html 最上面的 FIREBASE_CONFIG。<br>Paste your Firebase settings into FIREBASE_CONFIG at the top of index.html.</p></div>`;
+}
+
 /* ---------- presenter ---------- */
-function presenter(){
-  let step = 0, peer = null, myId = store.get("kq_host_id");
-  const conns = new Map();                    // peerId -> conn
-  const answered = Array.from({length:N+1}, () => new Set());
-  const results = new Map();                  // peerId -> key
-  let idTries = 0, status = "连接中… Connecting…";
+async function presenter(){
+  let sid = local.get("kq_sid");
+  if (!sid) { sid = rid(); local.set("kq_sid", sid); }
+  let step = 0, online = false, joined = 0, answers = {}, results = {}, be = null, gotStep = false;
 
-  const newId = () => "kq-" + Math.random().toString(36).slice(2,8);
-  if (!myId) { myId = newId(); store.set("kq_host_id", myId); }
-
-  function joinUrl(){ return location.origin + location.pathname + "?join=" + encodeURIComponent(myId); }
-  function broadcast(){ for (const c of conns.values()) { try{ c.open && c.send({type:"state", step}); }catch(e){} } }
-  function setStep(s){ step = Math.max(0, Math.min(STEP_FINAL, s)); broadcast(); render(); }
-
-  function start(){
-    if (typeof Peer === "undefined") { status = "⚠️ 无法载入连线工具（请检查网络）· Could not load the connection library — check the internet."; render(); return; }
-    peer = new Peer(myId, PEER_OPTS);
-    peer.on("open", () => { status = "已上线 · Live"; render(); });
-    peer.on("connection", c => {
-      c.on("open", () => { conns.set(c.peer, c); c.send({type:"state", step}); render(); });
-      c.on("data", d => {
-        if (!d || typeof d !== "object") return;
-        if (d.type === "answer" && Number.isInteger(d.q) && d.q>=1 && d.q<=N) { answered[d.q].add(c.peer); render(); }
-        if (d.type === "result" && RESULTS[d.r]) { results.set(c.peer, d.r); render(); }
-      });
-      c.on("close", () => { conns.delete(c.peer); render(); });
-    });
-    peer.on("disconnected", () => { status = "重新连接中… Reconnecting…"; render(); try{ peer.reconnect(); }catch(e){} });
-    peer.on("error", err => {
-      if (err && err.type === "unavailable-id") {
-        try{ peer.destroy(); }catch(e){}
-        if (idTries++ < 3) { setTimeout(start, 2500); return; }   // old session may still be releasing the id
-        myId = newId(); store.set("kq_host_id", myId); idTries = 0; setTimeout(start, 300); render(); return;
-      }
-      if (err && (err.type === "network" || err.type === "server-error" || err.type === "socket-error")) {
-        status = "⚠️ 连线服务器有问题，正在重试… Connection server problem, retrying…"; render();
-        setTimeout(() => { try{ peer.destroy(); }catch(e){} start(); }, 4000);
-      }
-    });
+  const joinUrl = () => location.origin + location.pathname + "?join=" + encodeURIComponent(sid);
+  function setStep(s){
+    step = Math.max(0, Math.min(STEP_FINAL, s));
+    if (be) be.set(ROOT(sid) + "/step", step);
+    render();
   }
-
+  function newSession(){
+    if (!confirm("开始新场次？所有人需要重新扫描 QR。\nStart a new session? Everyone will need to scan the new QR.")) return;
+    sid = rid(); local.set("kq_sid", sid); location.reload();
+  }
   function qrHtml(){
     if (typeof qrcode === "undefined") return `<div class="qrbox" style="color:#2a1650;padding:30px">QR 载入失败<br>QR failed to load</div>`;
     const q = qrcode(0, "M"); q.addData(joinUrl()); q.make();
@@ -198,7 +211,6 @@ function presenter(){
   }
 
   function render(){
-    const joined = conns.size;
     if (step === 0) {
       app.innerHTML = `
         <h1>天国身份测验<span class="en">Kingdom Identity Quiz</span></h1>
@@ -213,8 +225,8 @@ function presenter(){
         <div class="p-q">${esc(Q.zh)}<span class="en">${esc(Q.en)}</span></div>
         <div class="p-opts">${Q.o.map((o,i)=>`<div class="p-opt"><span class="letter">${LETTERS[i]}</span><div>${esc(o[0])}<span class="en">${esc(o[1])}</span></div></div>`).join("")}</div>`;
     } else if (step === STEP_RESULT) {
-      const counts = {A:0,B:0,C:0,D:0}; for (const r of results.values()) counts[r]++;
-      const total = results.size || 1;
+      const counts = {A:0,B:0,C:0,D:0}; for (const k in results) if (counts[results[k]]!==undefined) counts[results[k]]++;
+      const total = count(results) || 1;
       app.innerHTML = `
         <h1>请看你的手机！<span class="en">Look at your phone!</span></h1>
         <p class="big muted">你今天最需要听见哪一个身份？<span class="en">Which identity do you most need to hear today?</span></p>
@@ -225,59 +237,57 @@ function presenter(){
         <h1>其实，这四个身份你全都是！<span class="en">Actually — you are all four!</span></h1>
         <div class="four">${LETTERS.map(k=>`<div><span class="ic">${RESULTS[k].ic}</span>${RESULTS[k].zh}<span class="en">${RESULTS[k].en}</span></div>`).join("")}</div>`;
     }
-    const ans = (step>=1 && step<=N) ? ` · 已作答 Answered：${answered[step].size}/${joined}` : "";
+    const ans = (step>=1 && step<=N) ? ` · 已作答 Answered：${count(answers[step])}/${joined}` : "";
+    const st = be ? (online ? "已上线 · Live" : "连接中… Connecting…") : "连接中… Connecting…";
     bar.classList.remove("hidden");
     bar.innerHTML = `
-      <span class="muted">${esc(status)} · 已加入 Joined：${joined}${ans}</span>
+      <span class="muted">${st} · 已加入 Joined：${joined}${ans}</span>
       <span class="row">
         <button class="btn ghost" id="prev" ${step===0?"disabled":""}>← 上一步</button>
         <span class="progress">${step===0?"大厅 Lobby":step<=N?`${step}/${N}`:step===STEP_RESULT?"结果 Results":"总结 Finale"}</span>
         <button class="btn" id="next" ${step===STEP_FINAL?"disabled":""}>${step===0?"开始 Start":step===N?"显示结果 Show results":"下一步 →"}</button>
         <button class="btn ghost" id="qr" title="Show QR again">QR</button>
+        <button class="btn ghost" id="reset" title="New session">新场次</button>
       </span>`;
     document.getElementById("prev").onclick = () => setStep(step-1);
     document.getElementById("next").onclick = () => setStep(step+1);
     document.getElementById("qr").onclick = () => setStep(0);
+    document.getElementById("reset").onclick = newSession;
   }
 
   document.addEventListener("keydown", e => {
+    if (e.target && e.target.tagName === "BUTTON" && (e.key === " " || e.key === "Enter")) return;
     if (["ArrowRight","PageDown"," ","Enter"].includes(e.key)) { e.preventDefault(); setStep(step+1); }
     if (["ArrowLeft","PageUp","Backspace"].includes(e.key)) { e.preventDefault(); setStep(step-1); }
   });
-  render(); start();
+
+  render();
+  try { be = await connectBackend(); } catch(e) { if (String(e && e.message) === "config") return configError(); render(); return; }
+  const root = ROOT(sid);
+  be.onConn(c => { online = c; render(); });
+  be.watch(root + "/step", v => {
+    if (!gotStep) { gotStep = true; if (Number.isInteger(v)) { step = v; render(); } else be.set(root + "/step", step); }
+  });
+  be.watch(root + "/p", v => { joined = count(v); render(); });
+  be.watch(root + "/a", v => { answers = v || {}; render(); });
+  be.watch(root + "/r", v => { results = v || {}; render(); });
 }
 
 /* ---------- participant ---------- */
-function participant(hostId, solo){
-  const KEY = "kq_answers_" + (hostId || "solo");
-  let answers = store.get(KEY) || {};
-  let step = solo ? 1 : 0, conn = null, peer = null, connected = false, sentResult = false, retryTimer = null;
+async function participant(sid, solo){
+  const KEY = "kq_answers_" + (sid || "solo");
+  let answers = sess.get(KEY) || {};
+  let pid = sess.get("kq_pid"); if (!pid) { pid = rid(10); sess.set("kq_pid", pid); }
+  let step = solo ? 1 : 0, online = false, found = null, be = null, sentResult = null, slow = false;
+  const root = sid ? ROOT(sid) : null;
 
-  function save(){ store.set(KEY, answers); }
-  function send(msg){ try{ conn && conn.open && conn.send(msg); }catch(e){} }
-
+  function save(){ sess.set(KEY, answers); }
   function choose(q, i){
-    answers[q] = i; save(); send({type:"answer", q});
+    answers[q] = i; save();
+    if (be) be.set(`${root}/a/${q}/${pid}`, 1);
     render();
     if (solo) setTimeout(() => { step = (q < N) ? q+1 : STEP_RESULT; render(); }, 250);
   }
-
-  function connect(){
-    if (typeof Peer === "undefined") { render(); return; }
-    try{ peer && peer.destroy(); }catch(e){}
-    peer = new Peer(PEER_OPTS);
-    peer.on("open", () => {
-      conn = peer.connect(hostId, {reliable:true});
-      conn.on("open", () => { connected = true; render(); });
-      conn.on("data", d => {
-        if (d && d.type === "state" && Number.isInteger(d.step)) { step = d.step; render(); }
-      });
-      conn.on("close", () => { connected = false; render(); scheduleRetry(); });
-      conn.on("error", () => { connected = false; scheduleRetry(); });
-    });
-    peer.on("error", () => { connected = false; render(); scheduleRetry(); });
-  }
-  function scheduleRetry(){ if (retryTimer) return; retryTimer = setTimeout(() => { retryTimer = null; if (!connected) connect(); }, 3000); }
 
   function resultHtml(){
     const r = computeResult(answers);
@@ -286,7 +296,7 @@ function participant(hostId, solo){
         <h1 style="font-size:30px">你还没有作答<span class="en">You haven’t answered yet</span></h1>
         <div class="card" style="margin-top:14px">${esc(FOOTER.zh)}<div class="note">${esc(FOOTER.en)}</div></div></div>`;
     }
-    if (!sentResult && connected) { send({type:"result", r}); sentResult = true; }
+    if (be && sentResult !== r) { be.set(`${root}/r/${pid}`, r); sentResult = r; }
     const R = RESULTS[r];
     return `<div class="ph">
       <div class="tag">只有你看得到 · Only you can see this</div>
@@ -303,14 +313,17 @@ function participant(hostId, solo){
   }
 
   function render(){
-    const libMissing = !solo && typeof Peer === "undefined";
     if (step === 0) {
+      let msg, sub;
+      if (online && found === false) { msg = "⚠️ 找不到这个场次"; sub = "This session wasn’t found — please scan the QR on the screen again."; }
+      else if (online && found) { msg = "✅ 已加入！请看大屏幕，等讲员开始。"; sub = "You’re in! Watch the big screen."; }
+      else { msg = "连接中… Connecting…"; sub = slow ? "如果一直连不上，可以按下面自己做。If it won’t connect, you can do it on your own below." : ""; }
       app.innerHTML = `<div class="ph">
         <div class="crown">👑</div>
         <h1 style="font-size:32px">天国身份测验<span class="en">Kingdom Identity Quiz</span></h1>
-        <p class="big" style="font-size:20px">${libMissing ? "⚠️ 连不上 · Can’t connect" : connected ? "✅ 已加入！请看大屏幕，等讲员开始。" : "连接中… Connecting…"}</p>
-        <p class="note">${connected ? "You’re in! Watch the big screen." : "如果一直连不上，可以按下面自己做。If it won’t connect, you can do it on your own below."}</p>
-        ${connected ? "" : `<button class="btn ghost" id="goSolo">自己做 · Do it on my own</button>`}
+        <p class="big" style="font-size:20px">${msg}</p>
+        <p class="note">${sub}</p>
+        ${(online && found) ? "" : (slow ? `<button class="btn ghost" id="goSolo">自己做 · Do it on my own</button>` : "")}
       </div>`;
       const g = document.getElementById("goSolo"); if (g) g.onclick = () => { location.search = "?solo"; };
       return;
@@ -323,6 +336,7 @@ function participant(hostId, solo){
         ${Q.o.map((o,i)=>`<button class="ph-opt ${sel===i?"sel":""}" data-i="${i}"><span class="letter">${LETTERS[i]}</span><div>${esc(o[0])}<span class="en">${esc(o[1])}</span></div></button>`).join("")}
         <p class="note">${solo ? "" : (sel!==undefined ? "✅ 已选择，可以改。等讲员下一题 · Saved — you can change it. Wait for the next question." : "选一个最像你的 · Pick the one most like you")}</p>
         ${solo && step>1 ? `<button class="btn ghost" id="back">← 上一题 Back</button>` : ""}
+        ${!solo && !online ? `<p class="note">⚠️ 网络断了，重新连接中… Reconnecting…</p>` : ""}
       </div>`;
       app.querySelectorAll(".ph-opt").forEach(b => b.onclick = () => choose(step, Number(b.dataset.i)));
       const bk = document.getElementById("back"); if (bk) bk.onclick = () => { step--; render(); };
@@ -332,10 +346,15 @@ function participant(hostId, solo){
   }
 
   render();
-  if (!solo) {
-    connect();
-    setTimeout(() => { if (!connected) render(); }, 8000);
-  }
+  if (solo) return;
+  setTimeout(() => { slow = true; if (step === 0) render(); }, 10000);
+  try { be = await connectBackend(); } catch(e) { if (String(e && e.message) === "config") return configError(); slow = true; render(); return; }
+  be.onConn(c => { online = c; render(); });
+  be.presence(`${root}/p/${pid}`);
+  be.watch(`${root}/step`, v => {
+    if (Number.isInteger(v)) { found = true; step = v; } else { found = false; step = 0; }
+    render();
+  });
 }
 
 /* ---------- route ---------- */
