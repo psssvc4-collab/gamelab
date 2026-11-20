@@ -109,14 +109,14 @@ const QUESTIONS = [
 ];
 // Option index 0=A 1=B 2=C 3=D → result key
 const RESULTS = {
-  A:{ic:"👑", zh:"儿女", en:"Son / Daughter",
+  A:{ic:"👑", zh:"继承人", en:"Heir",
      msg:"天父要你知道：你是他心爱的儿女，是他的继承人。", msgEn:"Your Father wants you to know: you are His beloved child — His heir.",
      verse:"可见，从此以后，你不是奴仆，乃是儿子了；既是儿子，就靠着神为后嗣。", ref:"加拉太书 Galatians 4:7"},
-  B:{ic:"🏰", zh:"公民", en:"Citizen",
-     msg:"天父要你知道：你不是外人，你是天国的公民，是神家里的人。", msgEn:"You are not an outsider. You are a citizen of heaven, part of God’s family.",
+  B:{ic:"🏠", zh:"家人", en:"Family",
+     msg:"天父要你知道：你不是外人，你是神家里的人。", msgEn:"You are not an outsider. You belong to God’s family.",
      verse:"这样，你们不再作外人和客旅，是与圣徒同国，是神家里的人了；", ref:"以弗所书 Ephesians 2:19"},
   C:{ic:"🔑", zh:"管家", en:"Steward",
-     msg:"天父要你知道：他信任你，你是他的好管家。", msgEn:"Your Father trusts you. You are His good steward.",
+     msg:"天父要你知道：他信任你，你是神百般恩赐的好管家。", msgEn:"Your Father trusts you. You are a good steward of God’s grace.",
      verse:"各人要照所得的恩赐彼此服侍，作神百般恩赐的好管家。", ref:"彼得前书 1 Peter 4:10"},
   D:{ic:"🛡️", zh:"精兵", en:"Soldier",
      msg:"天父要你知道：你是基督耶稣的精兵。", msgEn:"You are a good soldier of Christ Jesus.",
@@ -229,7 +229,7 @@ async function presenter(){
       const total = count(results) || 1;
       app.innerHTML = `
         <h1>请看你的手机！<span class="en">Look at your phone!</span></h1>
-        <p class="big muted">你今天最需要听见哪一个身份？<span class="en">Which identity do you most need to hear today?</span></p>
+        <p class="big muted">天父说，你是……<span class="en">Your Father says, you are…</span></p>
         <div class="dist">${LETTERS.map(k=>`<div class="r"><span>${RESULTS[k].ic} ${RESULTS[k].zh}</span><div class="track"><div class="fill" style="width:${Math.round(counts[k]/total*100)}%"></div></div><span>${counts[k]}</span></div>`).join("")}</div>
         <p class="note">全场统计（匿名）· Whole-room count (anonymous)</p>`;
     } else {
